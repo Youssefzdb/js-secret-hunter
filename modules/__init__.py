@@ -1,1 +1,0 @@
-# JS Secret Hunter Modules
