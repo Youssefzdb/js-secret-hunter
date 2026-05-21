@@ -1,95 +1,138 @@
 #!/usr/bin/env python3
-"""Decoder v2 - Base64, JWT, Hex, ROT13, URL, Unicode, JS eval patterns"""
-import base64, json, re, binascii
-from urllib.parse import unquote
+"""Decoder v3 - JWT, Base64, Hex, ROT13, Unicode, JS obfuscation deobfuscation"""
+import base64, json, re, binascii, codecs
 
 class Decoder:
-    def _try_base64(self, value):
-        try:
-            padded = value + "=" * (4 - len(value) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-            printable = sum(c.isprintable() for c in decoded) / max(len(decoded), 1)
-            if printable > 0.85 and len(decoded) > 4:
-                return f"[BASE64] {decoded[:300]}"
-        except:
-            pass
-        return None
 
-    def _try_jwt(self, value):
+    def decode_jwt(self, value):
         try:
             parts = value.split(".")
             if len(parts) == 3:
-                def _decode_part(p):
-                    p += "=" * (4 - len(p) % 4)
-                    return json.loads(base64.urlsafe_b64decode(p))
-                header  = _decode_part(parts[0])
-                payload = _decode_part(parts[1])
-                alg = header.get("alg", "?")
-                exp = payload.get("exp", "")
-                sub = payload.get("sub", payload.get("email", payload.get("user", "")))
-                return f"[JWT] alg={alg} sub={sub} exp={exp} | {json.dumps(payload)[:200]}"
+                header_raw = parts[0] + "=" * (4 - len(parts[0]) % 4)
+                header = json.loads(base64.urlsafe_b64decode(header_raw))
+                payload_raw = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(payload_raw))
+                return {
+                    "format": "JWT",
+                    "algorithm": header.get("alg", "?"),
+                    "type": header.get("typ", "JWT"),
+                    "payload": payload,
+                    "text": f"alg={header.get('alg','?')} | {json.dumps(payload, ensure_ascii=False)[:300]}"
+                }
         except:
             pass
         return None
 
-    def _try_hex(self, value):
-        clean = re.sub(r'[^0-9a-fA-F]', '', value)
-        if len(clean) >= 8 and len(clean) % 2 == 0:
+    def decode_base64(self, value):
+        for variant in [value, value.replace("-", "+").replace("_", "/")]:
             try:
-                decoded = binascii.unhexlify(clean).decode("utf-8", errors="ignore")
-                printable = sum(c.isprintable() for c in decoded) / max(len(decoded), 1)
-                if printable > 0.8 and len(decoded) > 3:
-                    return f"[HEX] {decoded[:200]}"
+                padded = variant + "=" * (4 - len(variant) % 4)
+                decoded = base64.b64decode(padded)
+                # Try UTF-8
+                text = decoded.decode("utf-8")
+                if len(text) > 4 and any(c.isalpha() for c in text[:20]):
+                    return {"format": "BASE64", "text": text[:300]}
             except:
                 pass
         return None
 
-    def _try_url(self, value):
-        try:
-            decoded = unquote(value)
-            if decoded != value and len(decoded) > 4:
-                return f"[URL] {decoded[:200]}"
-        except:
-            pass
+    def decode_hex(self, value):
+        clean = re.sub(r'[^0-9a-fA-F]', '', value)
+        if len(clean) >= 16 and len(clean) % 2 == 0:
+            try:
+                decoded = binascii.unhexlify(clean).decode("utf-8", errors="ignore")
+                if len(decoded) > 3 and any(c.isalpha() for c in decoded):
+                    return {"format": "HEX", "text": decoded[:300]}
+            except:
+                pass
         return None
 
-    def _try_unicode_escape(self, value):
+    def decode_unicode_escape(self, value):
         try:
             decoded = value.encode().decode("unicode_escape")
-            if decoded != value and len(decoded) > 3:
-                return f"[UNICODE] {decoded[:200]}"
+            if decoded != value and any(c.isalpha() for c in decoded):
+                return {"format": "UNICODE", "text": decoded[:300]}
         except:
             pass
         return None
 
-    def _try_rot13(self, value):
-        import codecs
+    def decode_url_encoding(self, value):
         try:
-            decoded = codecs.decode(value, "rot_13")
-            # ROT13 is only useful if result looks like a real string
-            if re.search(r'[a-zA-Z]{3,}', decoded):
-                return f"[ROT13] {decoded[:200]}"
+            from urllib.parse import unquote
+            decoded = unquote(value)
+            if decoded != value:
+                return {"format": "URL_ENCODED", "text": decoded[:300]}
         except:
             pass
+        return None
+
+    def decode_rot13(self, value):
+        try:
+            decoded = codecs.decode(value, "rot13")
+            # Only return if it looks like meaningful text
+            english_words = ["the", "and", "for", "api", "key", "secret", "token", "pass", "auth"]
+            if any(w in decoded.lower() for w in english_words):
+                return {"format": "ROT13", "text": decoded[:300]}
+        except:
+            pass
+        return None
+
+    def try_deobfuscate_js(self, value):
+        """Try basic JS string deobfuscation patterns"""
+        # \xNN hex escape
+        try:
+            decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                           lambda m: chr(int(m.group(1), 16)), value)
+            if decoded != value:
+                return {"format": "JS_HEX_ESCAPE", "text": decoded[:300]}
+        except:
+            pass
+
+        # \uNNNN unicode escape
+        try:
+            decoded = re.sub(r'\\u([0-9a-fA-F]{4})',
+                           lambda m: chr(int(m.group(1), 16)), value)
+            if decoded != value:
+                return {"format": "JS_UNICODE_ESCAPE", "text": decoded[:300]}
+        except:
+            pass
+
         return None
 
     def process(self, findings):
-        print("[*] Decoding obfuscated values...")
+        print("[*] Decoding & deobfuscating values...")
+        decoded_count = 0
+
         for f in findings:
             value = f.get("value", "")
-            decoded = None
+            result = None
+            t = f.get("type", "")
 
-            if f["type"] == "JWT Token" or value.startswith("eyJ"):
-                decoded = self._try_jwt(value)
-            elif f["type"] in ["Suspicious Base64", "Long Base64 String"] or len(value) % 4 == 0:
-                decoded = self._try_base64(value)
-            elif re.match(r'^[0-9a-fA-F]+$', value):
-                decoded = self._try_hex(value)
-            else:
-                decoded = self._try_url(value) or self._try_unicode_escape(value) or self._try_base64(value)
+            # JWT first
+            if t == "JWT Token" or (value.startswith("eyJ") and value.count(".") == 2):
+                result = self.decode_jwt(value)
 
-            if decoded:
-                f["decoded"] = decoded
-                print(f"  [+] Decoded {f['type']}: {decoded[:70]}...")
+            # Base64 for long strings
+            if not result and len(value) > 20:
+                result = self.decode_base64(value)
 
+            # Hex
+            if not result:
+                result = self.decode_hex(value)
+
+            # JS escape sequences
+            if not result:
+                result = self.try_deobfuscate_js(value)
+
+            # URL encoding
+            if not result:
+                result = self.decode_url_encoding(value)
+
+            if result:
+                f["decoded"] = result
+                decoded_count += 1
+                preview = result["text"][:80].replace("\n", " ")
+                print(f"  [+] {result['format']}: {preview}")
+
+        print(f"[+] Decoded {decoded_count}/{len(findings)} values")
         return findings
