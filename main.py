@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-js-secret-hunter v3 - Deep JS Secret & Credential Scanner
-Authorized penetration testing only
+js-secret-hunter v3
+Deep JS analysis tool for authorized web application pentests
 """
 import argparse, sys
 from modules.env_check import EnvironmentChecker
@@ -10,71 +10,75 @@ from modules.secret_scanner import SecretScanner
 from modules.decoder import Decoder
 from modules.report import SecretReport
 
-BANNER = r"""
-     ██╗███████╗    ██╗  ██╗██╗   ██╗███╗   ██╗████████╗███████╗██████╗
-     ██║██╔════╝    ██║  ██║██║   ██║████╗  ██║╚══██╔══╝██╔════╝██╔══██╗
-     ██║███████╗    ███████║██║   ██║██╔██╗ ██║   ██║   █████╗  ██████╔╝
-██   ██║╚════██║    ██╔══██║██║   ██║██║╚██╗██║   ██║   ██╔══╝  ██╔══██╗
-╚█████╔╝███████║    ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██║  ██║
- ╚════╝ ╚══════╝    ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝  v3
-"""
-
 def main():
     parser = argparse.ArgumentParser(
-        description="js-secret-hunter v3 — Deep JS Secret Scanner",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="JS Secret Hunter v3 — Authorized Pentest Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py --url http://192.168.1.100            # Lab target (auto-allowed)
+  python main.py --url http://10.10.10.50              # HTB/CTF target
+  python main.py --url https://target.com --scope target.com  # Authorized external
+  python main.py --url https://target.com --depth 4 --output pentest.html
+        """
     )
-    parser.add_argument("--url",    required=True, help="Target URL")
-    parser.add_argument("--scope",  help="Authorized scope (CIDR or domain)")
-    parser.add_argument("--depth",  type=int, default=2, help="Crawl depth (default: 2)")
-    parser.add_argument("--output", default="js_secrets_report.html")
-    parser.add_argument("--no-banner", action="store_true")
+    parser.add_argument("--url",    required=True,  help="Target URL")
+    parser.add_argument("--scope",  default=None,   help="Authorized scope (domain or CIDR)")
+    parser.add_argument("--depth",  type=int, default=3, help="Crawl depth (default: 3)")
+    parser.add_argument("--output", default="js_secrets_report.html", help="Output report file")
+    parser.add_argument("--no-env-check", action="store_true", help="Skip environment check (use with --scope)")
     args = parser.parse_args()
 
-    if not args.no_banner:
-        print(BANNER)
+    # ── Environment Check ─────────────────────────────────────────────
+    if not args.no_env_check:
+        checker = EnvironmentChecker(args.url, args.scope)
+        if not checker.validate():
+            print("\n[!] Environment check failed. Use --scope to define authorized target.")
+            sys.exit(1)
 
-    # Environment check
-    checker = EnvironmentChecker(args.url, args.scope)
-    if not checker.validate():
-        print("[!] Blocked: target not in authorized scope.")
-        sys.exit(1)
-
-    print(f"{'='*60}")
+    print(f"\n{'═'*60}")
+    print(f"  JS Secret Hunter v3")
     print(f"  Target : {args.url}")
     print(f"  Depth  : {args.depth}")
     print(f"  Output : {args.output}")
-    print(f"{'='*60}\n")
+    print(f"  ⚠️  FOR AUTHORIZED PENETRATION TESTING ONLY")
+    print(f"{'═'*60}\n")
 
-    # Step 1: Extract JS
-    extractor = JSExtractor(args.url, args.depth)
+    # ── Step 1: Extract JS ────────────────────────────────────────────
+    extractor = JSExtractor(args.url, depth=args.depth)
     js_files = extractor.extract()
 
     if not js_files:
-        print("[-] No JS files found.")
-        sys.exit(0)
+        print("[!] No JS files found. Check target URL.")
+        sys.exit(1)
 
-    # Step 2: Scan secrets
+    # ── Step 2: Scan secrets ──────────────────────────────────────────
     scanner = SecretScanner(js_files)
-    raw = scanner.scan()
+    findings = scanner.scan()
 
-    # Step 3: Decode
+    # ── Step 3: Decode obfuscated values ──────────────────────────────
     decoder = Decoder()
-    findings = decoder.process(raw)
+    findings = decoder.process(findings)
 
-    # Step 4: Summary
-    print(f"\n{'='*60}")
-    from collections import Counter
-    sev_counts = Counter(f["severity"] for f in findings)
-    for sev in ["CRITICAL","HIGH","MEDIUM","LOW"]:
-        n = sev_counts.get(sev, 0)
-        if n: print(f"  {sev:8}: {n}")
-    print(f"  {'TOTAL':8}: {len(findings)}")
-    print(f"{'='*60}")
-
-    # Step 5: Report
+    # ── Step 4: Report ────────────────────────────────────────────────
     report = SecretReport(args.url, js_files, findings)
     report.save(args.output)
+
+    # ── Summary ───────────────────────────────────────────────────────
+    sev_counts = {}
+    for f in findings:
+        s = f["severity"]
+        sev_counts[s] = sev_counts.get(s,0) + 1
+
+    print(f"\n{'═'*60}")
+    print(f"  SUMMARY")
+    print(f"  JS files analyzed : {len(js_files)}")
+    for s in ["CRITICAL","HIGH","MEDIUM","LOW"]:
+        n = sev_counts.get(s,0)
+        if n:
+            print(f"  {s:10} : {n}")
+    print(f"  Report : {args.output}")
+    print(f"{'═'*60}")
 
 if __name__ == "__main__":
     main()
