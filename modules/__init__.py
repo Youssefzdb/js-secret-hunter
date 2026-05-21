@@ -1,1 +1,1 @@
-# js-secret-hunter modules
+# JS Secret Hunter Modules
