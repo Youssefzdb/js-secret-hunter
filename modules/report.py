@@ -1,45 +1,44 @@
 #!/usr/bin/env python3
-"""Report v3 — Full HTML with remediation, entropy, severity scoring"""
+"""Report v4 - HTML with endpoints section + remediation + entropy scores"""
 from datetime import datetime
 
-SEV_COLOR = {"CRITICAL":"#ef4444","HIGH":"#f97316","MEDIUM":"#eab308","LOW":"#64748b"}
-SEV_BG    = {"CRITICAL":"#2d0000","HIGH":"#2d1200","MEDIUM":"#1a1500","LOW":"#0f0f1a"}
+SEV_ORDER = ["CRITICAL","HIGH","MEDIUM","LOW"]
+SEV_COLOR = {"CRITICAL":"#ef4444","HIGH":"#f97316","MEDIUM":"#facc15","LOW":"#94a3b8"}
+SEV_BG    = {"CRITICAL":"#2a0808","HIGH":"#2a1400","MEDIUM":"#2a2200","LOW":"#16162a"}
 
 REMEDIATION = {
-    "AWS Access Key ID":       "🔴 Rotate immediately via AWS IAM Console. Enable CloudTrail audit logging.",
-    "AWS Secret Access Key":   "🔴 Rotate immediately. Check IAM activity log for unauthorized usage.",
-    "GCP API Key":             "🔴 Restrict key in GCP Console to specific APIs/IPs. Rotate immediately.",
-    "Firebase Config Block":   "🔴 Secure Firebase rules. Restrict DB access to authenticated users only.",
-    "Stripe Secret Key":       "🔴 Rotate at dashboard.stripe.com. Never expose sk_live in frontend code.",
-    "Stripe Webhook Secret":   "🔴 Rotate webhook secret in Stripe dashboard.",
-    "GitHub PAT Classic":      "🔴 Revoke at github.com/settings/tokens immediately.",
-    "GitHub Fine-Grained PAT": "🔴 Revoke at github.com/settings/tokens immediately.",
-    "GitLab Token":            "🔴 Revoke at gitlab.com/-/profile/personal_access_tokens.",
-    "SendGrid API Key":        "🔴 Rotate at app.sendgrid.com/settings/api_keys.",
-    "Slack Bot Token":         "🔴 Revoke at api.slack.com/apps. Generate new token.",
-    "Twilio Account SID":      "🟠 Verify if paired with auth token. Rotate both in Twilio Console.",
-    "Discord Bot Token":       "🔴 Regenerate token in Discord Developer Portal immediately.",
-    "Telegram Bot Token":      "🔴 Revoke via @BotFather: /revoke",
-    "MongoDB URI":             "🔴 Rotate credentials. Move to server-side env vars. Use secrets manager.",
-    "PostgreSQL URI":          "🔴 Rotate credentials. Move to server-side env vars.",
-    "MySQL URI":               "🔴 Rotate credentials. Move to server-side env vars.",
-    "JWT Token":               "🟠 Check expiry. Verify not a long-lived token. Use HttpOnly cookies.",
-    "Private Key PEM":         "🔴 Replace key pair immediately. Audit for unauthorized usage.",
-    "SSH Private Key":         "🔴 Replace key pair immediately. Audit SSH access logs.",
-    "Hardcoded Password":      "🟠 Move to environment variables or a secrets vault (e.g., Vault, AWS Secrets Manager).",
-    "Hardcoded API Key":       "🟠 Move to server-side configuration. Never expose in frontend JS.",
-    "Hardcoded Secret":        "🟠 Move to server-side configuration or secrets manager.",
-    "Internal IP Exposed":     "🟡 Remove internal IPs from frontend JS. Use relative paths or API proxying.",
-    "Admin Endpoint":          "🟡 Ensure admin routes are protected by auth middleware.",
-    "S3 Bucket Exposed":       "🟡 Check bucket ACL/policy. Ensure no public write access.",
-    "Sensitive Comment":       "ℹ️ Review comment. Remove before production deployment.",
+    "AWS Access Key ID":        "Rotate via AWS IAM immediately. Enable CloudTrail.",
+    "GCP API Key":              "Restrict key scope in Google Cloud Console.",
+    "Firebase API Key":         "Add Firebase security rules. Restrict domains.",
+    "Stripe Secret Key":        "Rotate at dashboard.stripe.com. Never use sk_live in frontend.",
+    "GitHub PAT Classic":       "Revoke at github.com/settings/tokens.",
+    "GitHub PAT Fine-Grained":  "Revoke at github.com/settings/personal-access-tokens.",
+    "Slack Bot Token":          "Revoke at api.slack.com/apps.",
+    "SendGrid API Key":         "Rotate at app.sendgrid.com/settings/api_keys.",
+    "JWT Token":                "Check expiry/issuer. Use HttpOnly cookies for session tokens.",
+    "Twilio Account SID":       "Check for unauthorized usage at console.twilio.com.",
+    "MongoDB URI":              "Move to server-side env vars. Restrict DB network access.",
+    "PostgreSQL URI":           "Move to server-side env vars. Use connection pooling.",
+    "Private Key PEM":          "Replace key pair immediately. Check for unauthorized usage.",
+    "Hardcoded Password":       "Move to environment variables. Use a secrets manager.",
+    "Hardcoded Secret":         "Move to environment variables. Use .env + server-side config.",
+    "Discord Bot Token":        "Regenerate at discord.com/developers.",
+    "Telegram Bot Token":       "Revoke via @BotFather: /revoke command.",
+    "Internal IP Exposed":      "Remove internal IPs from frontend JS. Use API proxying.",
+    "Admin Path Disclosure":    "Restrict admin paths to VPN/IP allowlist.",
+    "CORS Misconfiguration":    "Replace wildcard with specific allowed origins.",
+    "Missing Header: Strict-Transport-Security": "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains",
+    "Missing Header: Content-Security-Policy":   "Implement CSP with strict directives.",
+    "Missing Header: X-Content-Type-Options":    "Add: X-Content-Type-Options: nosniff",
+    "Missing Header: X-Frame-Options":           "Add: X-Frame-Options: DENY",
 }
 
 class SecretReport:
-    def __init__(self, target, js_files, findings):
+    def __init__(self, target, js_files, findings, endpoints=None):
         self.target = target
         self.js_files = js_files
-        self.findings = findings
+        self.findings = sorted(findings, key=lambda x: SEV_ORDER.index(x.get("severity","LOW")))
+        self.endpoints = endpoints or []
 
     def _counts(self):
         c = {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0}
@@ -48,82 +47,126 @@ class SecretReport:
             c[s] = c.get(s,0) + 1
         return c
 
-    def save(self, filename="report.html"):
+    def save(self, filename):
         counts = self._counts()
-        risk = next((s for s in ["CRITICAL","HIGH","MEDIUM","LOW"] if counts[s]>0), "CLEAN")
-        risk_color = SEV_COLOR.get(risk,"#22c55e") if risk != "CLEAN" else "#22c55e"
+        risk = "CLEAN" if sum(counts.values()) == 0 else \
+               "CRITICAL" if counts["CRITICAL"] else \
+               "HIGH" if counts["HIGH"] else \
+               "MEDIUM" if counts["MEDIUM"] else "LOW"
+        risk_color = {"CLEAN":"#22c55e","CRITICAL":"#ef4444","HIGH":"#f97316",
+                      "MEDIUM":"#facc15","LOW":"#94a3b8"}.get(risk,"#888")
 
         rows = ""
         for f in self.findings:
             sev = f.get("severity","LOW")
-            c = SEV_COLOR.get(sev,"#888")
-            bg = SEV_BG.get(sev,"#111")
-            decoded = f'<div style="color:#34d399;font-size:11px;margin-top:4px;padding:2px 5px;background:#052e16;border-radius:3px">🔓 {f["decoded"][:200]}</div>' if f.get("decoded") else ""
-            snippet = f'<div style="color:#475569;font-size:11px;font-style:italic;margin-top:3px">{f.get("snippet","")[:120]}</div>' if f.get("snippet") else ""
-            rem = REMEDIATION.get(f["type"], "Review and rotate if sensitive.")
-            ent = f.get("entropy","?")
+            col = SEV_COLOR.get(sev,"#888")
+            bg  = SEV_BG.get(sev,"#111")
+            ent = f.get("entropy","")
+            ent_html = f'<span style="color:{"#ef4444" if isinstance(ent,float) and ent>3.5 else "#555"};font-size:10px">{ent}</span>' if ent else ""
+            dec = f.get("decoded")
+            dec_text = dec.get("text","") if isinstance(dec,dict) else (dec or "")
+            dec_html = f'<div style="color:#a78bfa;font-size:11px;margin-top:3px">🔓 {dec_text[:180]}</div>' if dec_text else ""
+            snip = f.get("snippet","")[:100]
+            snip_html = f'<div style="color:#475569;font-size:10px;margin-top:2px;font-style:italic">{snip}</div>' if snip else ""
+            remediation = REMEDIATION.get(f["type"], "Review and rotate if sensitive.")
             rows += f"""<tr style="background:{bg}">
-              <td><span style="background:{c};color:#fff;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:bold">{sev}</span></td>
-              <td style="font-weight:bold;color:#c4b5fd">{f["type"]}</td>
-              <td style="max-width:380px">
-                <code style="color:#a78bfa;font-size:11px;word-break:break-all;background:#0d0d1a;padding:2px 4px;border-radius:3px">{f["value"][:100]}</code>
-                {decoded}{snippet}
-              </td>
-              <td style="font-size:11px;color:#64748b">{f.get("source","")}<br>Line {f.get("line","?")} | ent={ent}</td>
-              <td style="font-size:11px;color:#94a3b8">{rem}</td>
+              <td><span style="color:{col};font-weight:bold;font-size:12px">{sev}</span></td>
+              <td style="font-size:12px;white-space:nowrap">{f['type']}</td>
+              <td><code style="font-size:11px;word-break:break-all;color:#a78bfa">{f['value'][:110]}</code>{dec_html}{snip_html}</td>
+              <td style="font-size:11px;color:#64748b;white-space:nowrap">{f.get('source','')[:35]}</td>
+              <td style="text-align:center">{ent_html}</td>
+              <td style="font-size:11px;color:#7c7c9a">{remediation}</td>
             </tr>"""
 
-        js_rows = "".join(
-            f'<li style="font-size:11px;color:#3a3a5a;padding:1px 0"><code style="color:#4a4a7a">{url[:90]}</code> <span style="color:#2a2a4a">({len(c):,}b)</span></li>'
+        ep_rows = ""
+        for ep in self.endpoints[:50]:
+            methods = ", ".join(ep.get("methods",[]))
+            info = ep.get("info","")
+            ep_rows += f"""<tr>
+              <td><code style="font-size:11px">{ep['url'][:80]}</code></td>
+              <td style="font-size:12px;color:#a78bfa">{methods}</td>
+              <td style="font-size:11px;color:{'#f97316' if info else '#555'}">{info or '—'}</td>
+            </tr>"""
+
+        js_list = "".join(
+            f'<li><code style="color:#475569;font-size:11px">{url[:90]}</code> <span style="color:#333">({len(c):,}b)</span></li>'
             for url,c in list(self.js_files.items())[:50]
         )
 
-        html = f"""<!DOCTYPE html><html lang="en"><head>
+        html = f"""<!DOCTYPE html>
+<html lang="en"><head>
 <meta charset="UTF-8">
-<title>JS Secret Hunter v3 | {self.target}</title>
+<title>js-secret-hunter v4 — {self.target}</title>
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:'Segoe UI',system-ui,sans-serif;background:#070711;color:#e2e0ff;padding:28px;font-size:13px;line-height:1.5}}
-h1{{color:#a78bfa;font-size:1.5em;margin-bottom:2px}}
-h2{{color:#7c6fcd;font-size:1em;margin:22px 0 8px;border-bottom:1px solid #1a1a2e;padding-bottom:4px}}
-.meta{{color:#3a3a5a;font-size:11px;margin-bottom:18px}}
-.banner{{border:2px solid {risk_color};border-radius:10px;background:#0d0d1a;padding:16px 24px;margin:14px 0;display:flex;align-items:center;gap:24px}}
-.risk{{font-size:2.2em;font-weight:900;color:{risk_color}}}
-.stats{{display:flex;gap:10px;margin:14px 0;flex-wrap:wrap}}
-.stat{{background:#0d0d1a;border:1px solid #1a1a2e;border-radius:8px;padding:10px 18px;text-align:center;min-width:70px}}
-.stat .n{{font-size:1.8em;font-weight:bold}}
-table{{width:100%;border-collapse:collapse;font-size:12px}}
-td,th{{padding:7px 9px;border:1px solid #111128;vertical-align:top}}
-th{{background:#0d0d20;color:#7c6fcd;font-size:11px;text-transform:uppercase}}
-ul{{background:#0a0a15;border-radius:6px;padding:8px 18px;max-height:180px;overflow-y:auto;margin-top:4px}}
-.clean{{background:#052e16;border:1px solid #166534;border-radius:8px;padding:14px 20px;color:#22c55e}}
-.footer{{margin-top:28px;color:#1e1e3a;font-size:10px;text-align:center}}
+body{{font-family:'Segoe UI',system-ui,sans-serif;background:#050510;color:#ddd8ff;padding:28px;font-size:14px}}
+h1{{color:#a78bfa;font-size:1.5em;font-weight:700}}
+h2{{color:#7c6fd4;font-size:1em;margin:20px 0 8px;text-transform:uppercase;letter-spacing:1px}}
+.meta{{color:#3a3a5a;font-size:12px;margin:4px 0 16px}}
+.risk{{display:inline-flex;align-items:center;gap:14px;background:#0d0d20;border:2px solid {risk_color};border-radius:10px;padding:12px 20px;margin:12px 0}}
+.risk-label{{font-size:2em;font-weight:bold;color:{risk_color}}}
+.stats{{display:flex;gap:8px;margin:14px 0;flex-wrap:wrap}}
+.stat{{background:#0c0c1e;border:1px solid #1c1c3a;border-radius:8px;padding:10px 16px;text-align:center;min-width:75px}}
+.stat .n{{font-size:1.8em;font-weight:bold;line-height:1}}
+.stat .l{{font-size:10px;color:#3a3a5a;margin-top:2px}}
+.card{{background:#08081a;border:1px solid #14143a;border-radius:10px;padding:16px;margin:14px 0}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+td,th{{padding:7px 9px;border-bottom:1px solid #0c0c20;vertical-align:top}}
+th{{background:#060618;color:#7c86d4;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}}
+tr:hover td{{background:#0d0d22}}
+code{{font-family:'Courier New',monospace}}
+ul{{list-style:none;max-height:170px;overflow-y:auto;padding:8px 12px;background:#040410;border-radius:6px}}
+li{{padding:1px 0}}
+.empty{{text-align:center;color:#22c55e;padding:20px;font-size:13px}}
+.footer{{margin-top:20px;text-align:center;color:#1a1a3a;font-size:11px}}
 </style></head><body>
-<h1>🔍 JS Secret Hunter <small style="color:#333;font-size:0.6em">v3</small></h1>
-<p class="meta">Target: <b style="color:#a78bfa">{self.target}</b> &nbsp;|&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')} &nbsp;|&nbsp; ⚠️ Authorized penetration testing only</p>
 
-<div class="banner">
-  <div><div style="color:#444;font-size:10px;text-transform:uppercase">Risk Level</div><div class="risk">{risk}</div></div>
+<h1>🔍 js-secret-hunter <span style="color:#3a3a6a;font-weight:400">v4</span></h1>
+<p class="meta">Target: <b style="color:#a78bfa">{self.target}</b> &nbsp;·&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M UTC')} &nbsp;·&nbsp; Authorized penetration testing only</p>
+
+<div class="risk">
   <div>
-    <div style="color:#555">JS files analyzed: <b style="color:#a78bfa">{len(self.js_files)}</b></div>
-    <div style="color:#555">Total findings: <b style="color:#a78bfa">{len(self.findings)}</b></div>
+    <div style="color:#2a2a4a;font-size:10px;text-transform:uppercase">Risk Level</div>
+    <div class="risk-label">{risk}</div>
+  </div>
+  <div>
+    <div style="color:#666;font-size:12px">Findings: <b style="color:#ddd">{len(self.findings)}</b></div>
+    <div style="color:#666;font-size:12px">JS Files: <b style="color:#ddd">{len(self.js_files)}</b></div>
+    <div style="color:#666;font-size:12px">Endpoints: <b style="color:#ddd">{len(self.endpoints)}</b></div>
   </div>
 </div>
 
 <div class="stats">
-  {''.join(f'<div class="stat"><div class="n" style="color:{SEV_COLOR[s]}">{counts[s]}</div><div style="color:#333;font-size:10px">{s}</div></div>' for s in ["CRITICAL","HIGH","MEDIUM","LOW"])}
-  <div class="stat"><div class="n" style="color:#a78bfa">{len(self.js_files)}</div><div style="color:#333;font-size:10px">JS FILES</div></div>
+  <div class="stat"><div class="n" style="color:#ef4444">{counts['CRITICAL']}</div><div class="l">CRITICAL</div></div>
+  <div class="stat"><div class="n" style="color:#f97316">{counts['HIGH']}</div><div class="l">HIGH</div></div>
+  <div class="stat"><div class="n" style="color:#facc15">{counts['MEDIUM']}</div><div class="l">MEDIUM</div></div>
+  <div class="stat"><div class="n" style="color:#94a3b8">{counts['LOW']}</div><div class="l">LOW</div></div>
 </div>
 
-<h2>Findings</h2>
-{'<div class="clean">✅ No secrets detected — JavaScript appears clean.</div>' if not self.findings else
-f'<table><tr><th>Severity</th><th>Type</th><th>Value / Decoded</th><th>File / Line</th><th>Remediation</th></tr>{rows}</table>'}
+<div class="card">
+  <h2>🔑 Secrets & Credentials</h2>
+  <table>
+    <tr><th>Sev</th><th>Type</th><th>Value / Context</th><th>File</th><th>Entropy</th><th>Remediation</th></tr>
+    {''.join([rows]) if rows else '<tr><td colspan=6 class="empty">✅ No secrets detected</td></tr>'}
+  </table>
+</div>
 
-<h2>JS Sources Analyzed ({len(self.js_files)})</h2>
-<ul>{js_rows}</ul>
+{"" if not self.endpoints else f'''<div class="card">
+  <h2>🌐 API Endpoints ({len(self.endpoints)} accessible)</h2>
+  <table>
+    <tr><th>URL</th><th>Methods</th><th>Notes</th></tr>
+    {ep_rows}
+  </table>
+</div>'''}
 
-<p class="footer">Generated by js-secret-hunter v3 · For authorized security assessments only</p>
+<div class="card">
+  <h2>📁 JS Files Scanned ({len(self.js_files)})</h2>
+  <ul>{js_list}</ul>
+</div>
+
+<p class="footer">js-secret-hunter v4 — For authorized security assessments only. Unauthorized use is illegal.</p>
 </body></html>"""
-        with open(filename,"w",encoding="utf-8") as fh:
+
+        with open(filename, "w", encoding="utf-8") as fh:
             fh.write(html)
-        print(f"[+] Report: {filename}")
+        print(f"[+] Report saved: {filename}")
