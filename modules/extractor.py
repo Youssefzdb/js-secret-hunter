@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-Secret Extractor — 50+ regex patterns to find secrets in JS files.
-Covers: API keys, tokens, passwords, JWTs, private keys, cloud credentials, etc.
+Secret Extractor — 50+ regex patterns to find real secrets in JS files.
+False positive filters:
+  - Variable references (config.x, encodeURIComponent(x), typeof x)
+  - Charset/alphabet constants (abcdef..., ABCDEF..., base64 alphabet)
+  - Cloudflare Turnstile / PoW challenges (_hvc, window._hvc)
+  - _0x obfuscated string arrays
+  - Short/trivial values
 """
 import re
+import math
+from collections import Counter
 
+# ── Patterns ──────────────────────────────────────────────────────────────────
 SECRET_PATTERNS = {
-    # === Cloud / Platform API Keys (high confidence — fixed format) ===
+    # High-confidence fixed-format tokens (no false positives possible)
     "AWS Access Key":        r'(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])',
     "AWS Secret Key":        r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+=]{40})["\']',
     "Google API Key":        r'AIza[0-9A-Za-z\-_]{35}',
@@ -18,137 +26,186 @@ SECRET_PATTERNS = {
     "Stripe Secret Key":     r'sk_live_[0-9a-zA-Z]{24,}',
     "Stripe Public Key":     r'pk_live_[0-9a-zA-Z]{24,}',
     "Stripe Test Key":       r'sk_test_[0-9a-zA-Z]{24,}',
-    "Twilio Account SID":    r'AC[a-zA-Z0-9]{32}',
-    "Twilio Auth Token":     r'(?i)twilio.{0,20}["\']([a-f0-9]{32})["\']',
     "SendGrid API Key":      r'SG\.[0-9A-Za-z\-_]{22}\.[0-9A-Za-z\-_]{43}',
-    "Mailgun API Key":       r'key-[0-9a-zA-Z]{32}',
-    "Mailchimp API Key":     r'[0-9a-f]{32}-us[0-9]{1,2}',
     "Slack Token":           r'xox[baprs]-[0-9A-Za-z\-]{10,250}',
     "Slack Webhook":         r'https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+',
-    "Discord Token":         r'(?i)discord.{0,20}["\']([A-Za-z0-9\.\-_]{59,})["\']',
     "Discord Webhook":       r'https://discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9\-_]+',
-    "Telegram Bot Token":    r'[0-9]{8,10}:[A-Za-z0-9_-]{35,}',
+    "Telegram Bot Token":    r'(?<![A-Za-z0-9])[0-9]{8,10}:[A-Za-z0-9_-]{35,}(?![A-Za-z0-9])',
     "Shopify Token":         r'shpat_[a-fA-F0-9]{32}',
-    "Square OAuth Token":    r'sq0atp-[0-9A-Za-z\-_]{22}',
-    "PayPal/Braintree":      r'access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}',
-    "Notion Token":          r'secret_[A-Za-z0-9]{43}',
     "NPM Token":             r'npm_[A-Za-z0-9]{36}',
-    "Mapbox Token":          r'pk\.eyJ[A-Za-z0-9\.\-_]+',
+    "Mapbox Token":          r'pk\.eyJ[A-Za-z0-9\.\-_]{30,}',
     "Cloudinary URL":        r'cloudinary://[0-9]+:[A-Za-z0-9_\-]+@[A-Za-z0-9_\-]+',
     "Supabase Key":          r'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+',
     "OpenAI API Key":        r'sk-[A-Za-z0-9]{48}',
     "Anthropic API Key":     r'sk-ant-[A-Za-z0-9\-_]{90,}',
     "DigitalOcean Token":    r'dop_v1_[a-f0-9]{64}',
     "GCP Service Account":   r'"private_key_id":\s*"[a-f0-9]{40}"',
+    "Notion Token":          r'secret_[A-Za-z0-9]{43}',
 
-    # === Passwords & Secrets — must be assigned a LITERAL string value ===
-    # ✅ matches: password = "abc123!"
-    # ❌ skips:   password = someVariable  or  encodeURIComponent(config.password)
-    "Password in Code":  r'(?i)(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\'<>${}()\s]{8,})["\']',
-    "Secret in Code":    r'(?i)(?:^|[^a-z])(?:secret|secret_key|app_secret)\s*[=:]\s*["\']([^"\'<>${}()\s]{8,})["\']',
-    "API Key Generic":   r'(?i)(?:api_key|apikey|api-key)\s*[=:]\s*["\']([^"\'<>${}()\s]{16,})["\']',
+    # Literal string assignments ONLY (value must be in quotes, not a variable)
+    "Password in Code":  r'(?i)(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\'<>${}()\s\\]{8,})["\']',
+    "Secret in Code":    r'(?i)(?:app_secret|client_secret|secret_key)\s*[=:]\s*["\']([^"\'<>${}()\s\\]{10,})["\']',
+    "API Key Generic":   r'(?i)(?:api_key|apikey|api-key)\s*[=:]\s*["\']([^"\'<>${}()\s\\]{16,})["\']',
+    "Token in Code":     r'(?i)(?:access_token|auth_token|api_token)\s*[=:]\s*["\']([^"\'<>${}()\s\\]{20,})["\']',
+    "Bearer Token":      r'(?i)Authorization["\s]*:\s*["\']?Bearer\s+([A-Za-z0-9\-._~+/]{30,}=*)',
 
-    # Token in Code — only match LITERAL string assignments, not variable references
-    # ✅ matches: access_token = "eyABC..."  or  token: "abc123xyz"
-    # ❌ skips:   encodeURIComponent(config.user_token)  or  += "&token=" + someVar
-    "Token in Code":     r'(?i)(?:^|[,;{\s])(?:token|access_token|auth_token|api_token|user_token)\s*[=:]\s*["\']([^"\'<>${}()\s]{20,})["\']',
+    # Private Keys
+    "RSA Private Key":   r'-----BEGIN RSA PRIVATE KEY-----',
+    "EC Private Key":    r'-----BEGIN EC PRIVATE KEY-----',
+    "PGP Private Key":   r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
+    "Generic Private Key": r'-----BEGIN PRIVATE KEY-----',
+    "SSH Private Key":   r'-----BEGIN OPENSSH PRIVATE KEY-----',
 
-    "Bearer Token":      r'(?i)Authorization["\s]*:\s*["\']?Bearer\s+([A-Za-z0-9\-._~+/]+=*)',
-
-    # === Private Keys & Certificates ===
-    "RSA Private Key":       r'-----BEGIN RSA PRIVATE KEY-----',
-    "EC Private Key":        r'-----BEGIN EC PRIVATE KEY-----',
-    "PGP Private Key":       r'-----BEGIN PGP PRIVATE KEY BLOCK-----',
-    "Generic Private Key":   r'-----BEGIN PRIVATE KEY-----',
-    "SSH Private Key":       r'-----BEGIN OPENSSH PRIVATE KEY-----',
-    "Certificate":           r'-----BEGIN CERTIFICATE-----',
-
-    # === JWT Tokens ===
+    # JWT — 3-part dot-separated base64
     "JWT Token":         r'eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}',
 
-    # === Database & Connection Strings ===
-    "MongoDB URI":       r'mongodb(?:\+srv)?://[^\s"\'<>]+:[^\s"\'<>@]+@[^\s"\'<>]+',
-    "PostgreSQL URI":    r'postgres(?:ql)?://[^\s"\'<>]+:[^\s"\'<>@]+@[^\s"\'<>]+',
-    "MySQL URI":         r'mysql://[^\s"\'<>]+:[^\s"\'<>@]+@[^\s"\'<>]+',
-    "Redis URI":         r'redis://:?[^\s"\'<>@]+@[^\s"\'<>]+',
+    # DB URIs — must have credentials (user:pass@host)
+    "MongoDB URI":       r'mongodb(?:\+srv)?://[^"\'<>\s@:]+:[^"\'<>\s@]{4,}@[^"\'<>\s/]+',
+    "PostgreSQL URI":    r'postgres(?:ql)?://[^"\'<>\s@:]+:[^"\'<>\s@]{4,}@[^"\'<>\s/]+',
+    "MySQL URI":         r'mysql://[^"\'<>\s@:]+:[^"\'<>\s@]{4,}@[^"\'<>\s/]+',
+    "Redis URI":         r'redis://:?[^"\'<>\s@]{4,}@[^"\'<>\s/]+',
 
-    # === URLs with credentials — must have user:pass@host format ===
-    # ❌ skip Google Fonts, CDN links, etc.
-    "URL with credentials": r'https?://(?!fonts\.googleapis\.com)(?!.*\$\{)[^\s"\'<>@:]+:[^\s"\'<>@/]{4,}@[a-zA-Z0-9\.\-]+',
-
-    # === Encoded Strings (suspicious long blobs only) ===
-    # Only flag if it's inside a string literal (surrounded by quotes or assignment)
-    "Long Base64 String":     r'(?:["\']|=\s*)["\']?([A-Za-z0-9+/]{80,}={0,2})["\']',
-    "Hex Secret (32+ chars)": r'(?i)(?:key|secret|token|hash|salt)\s*[=:]\s*["\']([a-fA-F0-9]{32,64})["\']',
+    # URLs with embedded credentials (user:pass@host) — skip CDN/font URLs
+    "URL with credentials": r'https?://[A-Za-z0-9._%-]+:[A-Za-z0-9._~!$&\'()*+,;=%-]{4,}@[A-Za-z0-9.\-]+(?:\.[a-z]{2,})',
 }
 
-# Severity levels
 SEVERITY = {
-    "AWS Access Key":       "CRITICAL",
-    "AWS Secret Key":       "CRITICAL",
-    "GitHub Token":         "CRITICAL",
-    "GitHub Classic Token": "CRITICAL",
-    "Stripe Secret Key":    "CRITICAL",
-    "RSA Private Key":      "CRITICAL",
-    "EC Private Key":       "CRITICAL",
-    "PGP Private Key":      "CRITICAL",
-    "SSH Private Key":      "CRITICAL",
-    "OpenAI API Key":       "CRITICAL",
-    "Anthropic API Key":    "CRITICAL",
-    "MongoDB URI":          "CRITICAL",
-    "PostgreSQL URI":       "CRITICAL",
-    "MySQL URI":            "CRITICAL",
-    "URL with credentials": "CRITICAL",
-    "Google API Key":       "HIGH",
-    "Firebase":             "HIGH",
-    "Supabase Key":         "HIGH",
-    "JWT Token":            "HIGH",
-    "Slack Token":          "HIGH",
-    "Discord Token":        "HIGH",
-    "Telegram Bot Token":   "HIGH",
-    "Password in Code":     "HIGH",
-    "Secret in Code":       "HIGH",
-    "Bearer Token":         "HIGH",
-    "Token in Code":        "MEDIUM",
-    "API Key Generic":      "MEDIUM",
-    "Long Base64 String":   "LOW",
-    "Hex Secret (32+ chars)": "LOW",
+    "AWS Access Key": "CRITICAL", "AWS Secret Key": "CRITICAL",
+    "GitHub Token": "CRITICAL", "GitHub Classic Token": "CRITICAL",
+    "Stripe Secret Key": "CRITICAL", "OpenAI API Key": "CRITICAL",
+    "Anthropic API Key": "CRITICAL", "MongoDB URI": "CRITICAL",
+    "PostgreSQL URI": "CRITICAL", "MySQL URI": "CRITICAL",
+    "URL with credentials": "CRITICAL", "RSA Private Key": "CRITICAL",
+    "EC Private Key": "CRITICAL", "PGP Private Key": "CRITICAL",
+    "SSH Private Key": "CRITICAL", "Generic Private Key": "CRITICAL",
+    "GCP Service Account": "CRITICAL", "SendGrid API Key": "CRITICAL",
+    "Shopify Token": "CRITICAL", "DigitalOcean Token": "CRITICAL",
+    "Google API Key": "HIGH", "Firebase": "HIGH",
+    "Supabase Key": "HIGH", "JWT Token": "HIGH",
+    "Slack Token": "HIGH", "Discord Webhook": "HIGH",
+    "Telegram Bot Token": "HIGH", "Password in Code": "HIGH",
+    "Secret in Code": "HIGH", "Bearer Token": "HIGH",
+    "Mapbox Token": "HIGH",
+    "Token in Code": "MEDIUM", "API Key Generic": "MEDIUM",
 }
 
 def get_severity(name):
     return SEVERITY.get(name, "MEDIUM")
 
 
-# Values to SKIP — variable references, template strings, known false positives
-FP_PATTERNS = [
-    re.compile(r'encodeURIComponent\('),   # function call wrapping a variable
-    re.compile(r'\$\{'),                    # template literal variable
-    re.compile(r'config\.[a-zA-Z_]+$'),     # config.someVar reference
-    re.compile(r'\+\s*[a-zA-Z_]\w*\s*\)'), # + someVar)
-    re.compile(r'^[a-zA-Z_]\w*\.[a-zA-Z_]\w*$'),  # object.property
-    re.compile(r'typeof\s+'),               # typeof check
-    re.compile(r'^undefined$'),
-    re.compile(r'fonts\.googleapis\.com'),
-    re.compile(r'^https?://[a-z]+\.[a-z]+\.[a-z]+/css'), # CDN font/CSS URLs
+# ── False Positive Detection ───────────────────────────────────────────────────
+
+# Charset/alphabet constants — sequential runs of printable chars
+_CHARSET_PATTERNS = [
+    re.compile(r'^abcdefghijklmnopqrstuvwxyz', re.I),
+    re.compile(r'^ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'),
+    re.compile(r'^[A-Za-z]{26}[A-Za-z]{26}[0-9]{10}'),  # full alphanumeric charset
+    re.compile(r'0123456789\+/=?$'),                      # base64 alphabet suffix
 ]
 
-def is_false_positive(value: str) -> bool:
-    val = value.strip()
-    for fp in FP_PATTERNS:
-        if fp.search(val):
+# Known non-secret variable/code patterns
+_CODE_FRAGMENTS = [
+    'encodeURIComponent(', '.user_token', '.access_token', 'config.',
+    'beamer_config.', 'typeof ', 'undefined', 'function(', 'return ',
+    '&&', '||', '));', '));', '+encodeURI', '.ajax(', 'Beamer.',
+    'window._hvc', '._hvc', '"algorithm":', '"challenge":', '"maxnumber":',
+    '"salt":', 'SHA-256', 'sha-256',
+]
+
+# Skip Cloudflare PoW / Turnstile challenge blobs (window._hvc = "eyJ...")
+_TURNSTILE_RE = re.compile(r'window\._hvc\s*=')
+_POW_JSON_RE  = re.compile(r'\{.*"algorithm"\s*:.*"challenge"\s*:', re.DOTALL)
+
+# Skip _0x obfuscated string array entries
+_OBX_RE = re.compile(r'var\s+_0x[0-9a-f]+\s*=\s*\[')
+
+
+def _shannon_entropy(s: str) -> float:
+    """Measure randomness of a string (higher = more likely a real secret)."""
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    length = len(s)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+
+def _is_sequential(s: str) -> bool:
+    """Detect alphabetically or numerically sequential strings (charset constants)."""
+    if len(s) < 20:
+        return False
+    for pat in _CHARSET_PATTERNS:
+        if pat.search(s):
             return True
-    # Skip values that look like code (contain JS operators/keywords)
-    if any(kw in val for kw in [
-        'encodeURIComponent', 'typeof', 'undefined', 'function(',
-        'return ', '.user_token', '.access_token', 'config.',
-        '+encodeURI', '));', '&&', '||',
-    ]):
-        return True
-    # Skip very short or clearly non-secret values
+    # Detect long sequential runs: abcdefg... or ABCDEFG...
+    sequential = 0
+    for i in range(1, min(len(s), 30)):
+        if ord(s[i]) == ord(s[i-1]) + 1:
+            sequential += 1
+    return sequential >= 15  # 15+ sequential chars = charset constant
+
+
+def is_false_positive(value: str, context: str = "") -> bool:
+    """
+    Return True if this value is NOT a real secret.
+    context: the surrounding line of code (for extra checks).
+    """
+    val = value.strip()
+
+    # 1. Too short
     if len(val) < 8:
         return True
+
+    # 2. Code fragments / variable references
+    for kw in _CODE_FRAGMENTS:
+        if kw in val:
+            return True
+
+    # 3. Sequential charset strings (base64 alphabet, etc.)
+    if _is_sequential(val):
+        return True
+
+    # 4. Cloudflare Turnstile / PoW challenges via window._hvc
+    if context:
+        if _TURNSTILE_RE.search(context):
+            return True
+        if _OBX_RE.search(context):
+            return True
+
+    # 5. Decoded value looks like PoW JSON (algorithm + challenge)
+    # (catch when the raw value is the base64 of a challenge)
+    if len(val) > 40:
+        try:
+            import base64
+            decoded = base64.b64decode(val + "==").decode("utf-8", errors="replace")
+            if '"algorithm"' in decoded and '"challenge"' in decoded:
+                return True
+        except Exception:
+            pass
+
+    # 6. Placeholder / documentation values
+    placeholder_re = re.compile(
+        r'(?i)(YOUR_|EXAMPLE|REPLACE|PLACEHOLDER|<[A-Z_]+>|xxx+|000+|test_?key|dummy)',
+        re.I
+    )
+    if placeholder_re.search(val):
+        return True
+
+    # 7. URLs without credentials (CDN, fonts, etc.)
+    if val.startswith(('http://', 'https://')):
+        if '@' not in val:
+            return True
+        if 'fonts.googleapis.com' in val or 'css2?' in val:
+            return True
+
+    # 8. Low entropy for "generic" patterns (real keys are random)
+    entropy = _shannon_entropy(val)
+    if len(val) >= 20 and entropy < 3.0:
+        return True
+
     return False
 
+
+# ── Extractor ─────────────────────────────────────────────────────────────────
 
 class SecretExtractor:
     def __init__(self, logger):
@@ -165,23 +222,20 @@ class SecretExtractor:
 
         for name, regex in self._compiled.items():
             for match in regex.finditer(content):
-                value = match.group(1) if match.lastindex else match.group(0)
-                value = value.strip()
+                value = (match.group(1) if match.lastindex else match.group(0)).strip()
 
-                # Skip false positives
-                if is_false_positive(value):
+                # Get surrounding line for context-aware FP checks
+                pos = match.start()
+                line_num = content[:pos].count('\n') + 1
+                context_line = lines[line_num - 1] if line_num <= len(lines) else ""
+
+                if is_false_positive(value, context_line):
                     continue
 
-                # Deduplicate same type+value combo
                 key = f"{name}:{value[:60]}"
                 if key in seen:
                     continue
                 seen.add(key)
-
-                # Find line number
-                pos = match.start()
-                line_num = content[:pos].count('\n') + 1
-                line_snippet = lines[line_num - 1].strip()[:120] if line_num <= len(lines) else ""
 
                 finding = {
                     "type":     name,
@@ -189,7 +243,7 @@ class SecretExtractor:
                     "value":    value[:200],
                     "url":      url,
                     "line":     line_num,
-                    "snippet":  line_snippet,
+                    "snippet":  context_line.strip()[:120],
                     "decoded":  None,
                 }
                 findings.append(finding)
