@@ -1,105 +1,63 @@
-# 🕵️ JS Secret Hunter
+# js-secret-hunter v3 🔍
 
-> **Red Team JS Secrets Extraction Tool — by Shadow Core**
+Advanced JavaScript secret scanner for authorized web application penetration testing.
 
-Extract all JavaScript files from a target URL, hunt for secrets, API keys, tokens, and encoded strings — then decode/decrypt them automatically.
+## What it finds (50+ patterns)
 
----
-
-## ⚡ Features
-
-- 🔍 **JS Discovery** — Finds all JS files (external + inline) including webpack chunks, Next.js bundles, CRA builds
-- 🔑 **50+ Secret Patterns** — AWS, Google, GitHub, Stripe, Slack, Discord, OpenAI, Telegram, JWT, private keys, passwords, DB URIs, and more
-- 🔓 **Auto Decode/Decrypt** — Base64, JWT (header+payload), Hex, URL encoding, Unicode escapes, ROT13, XOR detection
-- 📊 **Severity Levels** — CRITICAL / HIGH / MEDIUM / LOW with color-coded output
-- 💾 **JSON Report** — Machine-readable output for integration with other tools
-- 🕸️ **Deep Crawl** — Follow links across subpages with configurable depth
-
----
-
-## 📦 Install
-
-```bash
-git clone https://github.com/Youssefzdb/js-secret-hunter
-cd js-secret-hunter
-pip install -r requirements.txt
-```
-
----
-
-## 🚀 Usage
-
-```bash
-# Basic scan (single page)
-python3 main.py https://target.com
-
-# Deep crawl (follow links, depth 3)
-python3 main.py https://target.com --deep --depth 3
-
-# Save JSON report
-python3 main.py https://target.com --output report.json
-
-# Verbose mode
-python3 main.py https://target.com -v
-
-# Skip decoding (faster)
-python3 main.py https://target.com --no-decode
-```
-
----
-
-## 🎯 What It Finds
-
-| Category | Examples |
+| Category | Secrets |
 |----------|---------|
-| **Cloud Keys** | AWS, GCP, Azure, DigitalOcean |
-| **API Services** | OpenAI, Stripe, Twilio, SendGrid, Mailgun |
-| **Dev Platforms** | GitHub, GitLab, NPM, Heroku |
-| **Comms** | Slack, Discord, Telegram |
-| **Databases** | MongoDB, PostgreSQL, MySQL, Redis URIs |
-| **Auth** | JWT tokens, Bearer tokens, OAuth secrets |
-| **Crypto** | Private keys (RSA, EC, PGP, SSH), certificates |
-| **Generic** | password=, api_key=, secret=, token= |
-| **Encoded** | Base64, Hex, URL-encoded, Unicode escapes |
+| ☁️ Cloud | AWS keys, GCP API keys, Azure secrets, Firebase config |
+| 💳 Payment | Stripe (live/webhook), Braintree, Square, PayPal |
+| 📨 Messaging | Slack (bot/user/webhook), Discord, Telegram, Twilio, SendGrid |
+| 🔑 Auth | JWT tokens, Bearer tokens, OAuth tokens, Basic auth |
+| 🗃️ Database | MongoDB, PostgreSQL, MySQL, Redis URIs + credentials |
+| 🐙 Git | GitHub PAT (classic + fine-grained), GitLab, NPM tokens |
+| 🔐 Crypto | Private keys (RSA/EC/SSH), Ethereum private keys |
+| ⚙️ Config | Hardcoded passwords, API keys, secrets, internal IPs, admin paths |
 
----
+## Features
 
-## 📋 Output Example
+- **Deep crawl** — follows links, probes 30+ common paths, discovers webpack chunks
+- **Source map extraction** — reads original pre-minified source code
+- **Webpack chunk discovery** — finds all JS bundles automatically  
+- **50+ patterns** with per-pattern entropy validation
+- **Zero false positives** — strict FP suppression (Cloudflare, reCAPTCHA, obfuscation arrays)
+- **Auto-decode** — Base64, JWT payload, Hex, URL encoding, Unicode escapes, Gzip
+- **HTML report** with remediation steps, entropy scores, and source snippets
+- **Environment checker** — restricts execution to authorized/lab targets
 
-```
-[1] Crawling target for JavaScript files...
-  📄 https://target.com/static/js/main.abc123.js
-  📄 https://target.com/static/js/chunk.456.js
+## Usage
 
-[2] Scanning 2 JS file(s) for secrets...
-  🔴 AWS Access Key → main.abc123.js:42
-  🟠 JWT Token → chunk.456.js:17
+```bash
+pip install -r requirements.txt
 
-[3] Attempting to decode/decrypt suspicious values...
+# Lab / internal target (auto-allowed)
+python main.py --url http://192.168.1.100
 
-=== FINDINGS REPORT ===
+# HackTheBox / CTF
+python main.py --url http://10.10.10.50
 
-🔴 CRITICAL (1 findings)
-  Type:    AWS Access Key
-  File:    https://target.com/static/js/main.abc123.js
-  Line:    42
-  Value:   AKIAIOSFODNN7EXAMPLE
+# Authorized external target
+python main.py --url https://target.com --scope target.com
 
-🟠 HIGH (1 findings)
-  Type:    JWT Token
-  Value:   eyJhbGciOiJIUzI1NiJ9...
-  Decoded:
-    [jwt] {"header": {"alg": "HS256"}, "payload": {"sub": "admin", "email": "admin@target.com"}}
+# Deep scan
+python main.py --url https://target.com --scope target.com --depth 5 --output results.html
 ```
 
----
+## Environment Checker
 
-## ⚠️ Legal Disclaimer
+| Target | Behavior |
+|--------|----------|
+| Private IP (10.x / 192.168.x) | ✅ Auto-allowed |
+| Lab domain (htb, thm, ctf, lab) | ✅ Auto-allowed |
+| `--scope` defined and matches | ✅ Allowed |
+| Public IP without scope | ⚠️ Requires explicit authorization confirmation |
+| Outside defined scope | ❌ Blocked |
 
-This tool is intended **ONLY** for authorized penetration testing, bug bounty programs, and security research on systems you own or have explicit written permission to test.
+## Requirements
 
-Unauthorized use against systems you do not own is illegal. The author assumes no responsibility for misuse.
-
----
-
-**Made with 🖤 by Shadow Core**
+```
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+urllib3>=1.26.0
+```
