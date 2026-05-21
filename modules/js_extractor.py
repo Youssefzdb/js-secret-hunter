@@ -1,182 +1,219 @@
 #!/usr/bin/env python3
-"""
-JS Extractor v2 - Deep crawling + source maps + webpack chunks
-"""
-import requests
-import re
+"""JS Extractor v3 - Deep crawl + sourcemap + webpack chunk discovery"""
+import requests, re, json
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
-import json
+import urllib3
+urllib3.disable_warnings()
+
+COMMON_PATHS = [
+    "/static/js/main.js", "/static/js/app.js", "/static/js/bundle.js",
+    "/assets/js/app.js", "/assets/js/main.js", "/assets/bundle.js",
+    "/js/app.js", "/js/main.js", "/js/bundle.js", "/js/index.js",
+    "/dist/bundle.js", "/dist/app.js", "/dist/main.js",
+    "/build/static/js/main.chunk.js", "/build/static/js/bundle.js",
+    "/public/js/app.js", "/vendor/js/app.js",
+    "/config.js", "/env.js", "/.env.js", "/settings.js",
+    "/api/config", "/api/settings", "/api/env",
+    "/robots.txt", "/sitemap.xml",
+    "/webpack.config.js", "/next.config.js", "/nuxt.config.js",
+    "/.well-known/security.txt",
+]
 
 class JSExtractor:
     def __init__(self, base_url, depth=3):
-        self.base_url = base_url
+        self.base_url = base_url.rstrip("/")
         self.depth = depth
         self.domain = urlparse(base_url).netloc
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
         })
         self.session.verify = False
         self.js_files = {}
+        self.visited_pages = set()
+        self.sourcemaps = {}
 
-    def _fetch(self, url, timeout=10):
+    def _get(self, url, timeout=10):
         try:
             r = self.session.get(url, timeout=timeout, allow_redirects=True)
             if r.status_code == 200:
-                return r.text
+                return r
         except:
             pass
         return None
 
-    def _extract_js_urls(self, html, base_url):
-        urls = set()
-        soup = BeautifulSoup(html, "html.parser")
+    def _extract_js_urls(self, page_url, html):
+        js_urls = set()
+        try:
+            soup = BeautifulSoup(html, "html.parser")
 
-        # <script src>
-        for tag in soup.find_all("script", src=True):
-            urls.add(urljoin(base_url, tag["src"]))
+            # <script src>
+            for tag in soup.find_all("script", src=True):
+                js_urls.add(urljoin(page_url, tag["src"]))
 
-        # Inline script references
-        patterns = [
-            r'["\']([^"\']*?\.js(?:\?[^"\']*)?)["\']',
-            r'import\s+[^"\']*["\']([^"\']+\.js)["\']',
-            r'require\(["\']([^"\']+\.js)["\']',
-            r'src:\s*["\']([^"\']+\.js)["\']',
-            r'loadScript\(["\']([^"\']+)["\']',
-            r'\.src\s*=\s*["\']([^"\']+\.js)["\']',
-        ]
-        for p in patterns:
-            for match in re.findall(p, html):
-                if not match.startswith("http"):
-                    match = urljoin(base_url, match)
-                urls.add(match)
+            # Inline script content — look for dynamic imports and references
+            for tag in soup.find_all("script"):
+                text = tag.string or ""
+                for match in re.findall(r'["\']([^"\']*\.js(?:\?[^"\']*)?)["\']', text):
+                    if "/" in match or match.endswith(".js"):
+                        js_urls.add(urljoin(page_url, match))
 
-        return urls
+            # data-src, data-main (RequireJS)
+            for tag in soup.find_all(attrs={"data-main": True}):
+                js_urls.add(urljoin(page_url, tag["data-main"]))
 
-    def _check_sourcemap(self, js_url, js_content):
-        """Extract and parse source maps for original source code"""
-        sm_url = None
-        match = re.search(r'//[#@]\s*sourceMappingURL=(.+)', js_content)
-        if match:
-            sm_path = match.group(1).strip()
-            if not sm_path.startswith("data:"):
-                sm_url = urljoin(js_url, sm_path)
+            # HTML comments sometimes reveal paths
+            for comment in soup.find_all(string=lambda t: isinstance(t, str) and "<!--" in str(t)):
+                for match in re.findall(r'["\']([^"\']*\.js)["\']', str(comment)):
+                    js_urls.add(urljoin(page_url, match))
 
-        if sm_url:
-            print(f"  [+] Source map found: {sm_url}")
-            sm_content = self._fetch(sm_url)
-            if sm_content:
-                try:
-                    sm = json.loads(sm_content)
-                    # Extract original source contents from sourcesContent
-                    sources = sm.get("sourcesContent", [])
-                    for i, src in enumerate(sources):
-                        if src and len(src) > 50:
-                            src_name = sm.get("sources", [f"source_{i}"])[i] if i < len(sm.get("sources",[])) else f"source_{i}"
-                            key = f"[SOURCEMAP:{js_url}:{src_name}]"
-                            self.js_files[key] = src
-                            print(f"    [+] Source: {src_name} ({len(src):,} bytes)")
-                except:
-                    pass
+            # Inline references in HTML attributes
+            for pattern in [
+                r'(?:src|href|content|action)\s*=\s*["\']([^"\']*\.js(?:\?[^"\']*)?)["\']',
+                r'require\s*\(["\']([^"\']+)["\']',
+                r'import\s+.*?from\s+["\']([^"\']+)["\']',
+                r'loadScript\s*\(["\']([^"\']+)["\']',
+                r'document\.write\s*\(["\']<script[^>]*src=["\']([^"\']+)',
+            ]:
+                for match in re.findall(pattern, html, re.IGNORECASE):
+                    if match.startswith(("http", "/")):
+                        js_urls.add(urljoin(page_url, match))
 
-    def _discover_webpack_chunks(self, html, base_url):
-        """Find webpack chunk manifests and load all chunks"""
+        except Exception as e:
+            pass
+        return js_urls
+
+    def _discover_webpack_chunks(self, js_content, base_url):
+        """Discover webpack chunk files from main bundle"""
         chunks = set()
 
-        # Look for webpack runtime chunk patterns
-        patterns = [
-            r'chunk-[a-f0-9]+\.js',
-            r'[0-9]+\.[a-f0-9]+\.chunk\.js',
-            r'runtime\.[a-f0-9]+\.js',
-            r'vendors\~[a-zA-Z0-9\-\.]+\.js',
-            r'main\.[a-f0-9]+\.js',
-            r'app\.[a-f0-9]+\.js',
-        ]
-        for p in patterns:
-            for m in re.findall(p, html):
-                chunks.add(urljoin(base_url, f"/static/js/{m}"))
-                chunks.add(urljoin(base_url, f"/assets/js/{m}"))
-                chunks.add(urljoin(base_url, f"/dist/{m}"))
+        # webpack chunk map: {0:"hash", 1:"hash2"...}
+        chunk_maps = re.findall(
+            r'\{(?:\d+\s*:\s*["\'][a-f0-9]{8,}["\'],?\s*){2,}\}', js_content
+        )
+        hashes = re.findall(r'"([a-f0-9]{8,20})"', " ".join(chunk_maps))
 
-        # webpack manifest
-        for manifest_path in ["/asset-manifest.json", "/webpack-manifest.json",
-                               "/.well-known/assetlinks.json", "/manifest.json"]:
-            manifest = self._fetch(urljoin(base_url, manifest_path))
-            if manifest:
-                try:
-                    data = json.loads(manifest)
-                    for v in data.values() if isinstance(data, dict) else []:
-                        if isinstance(v, str) and v.endswith(".js"):
-                            chunks.add(urljoin(base_url, v))
-                except:
-                    pass
+        # Common chunk naming patterns
+        for i in range(20):
+            for pattern in [
+                f"/static/js/{i}.chunk.js",
+                f"/static/js/{i}.js",
+                f"/js/chunk-{i}.js",
+                f"/dist/{i}.bundle.js",
+            ]:
+                chunks.add(urljoin(base_url, pattern))
+
+        # Extract publicPath
+        pub_path = re.search(r'__webpack_require__\.p\s*=\s*["\']([^"\']+)["\']', js_content)
+        if pub_path:
+            base = urljoin(base_url, pub_path.group(1))
+            for h in hashes[:10]:
+                chunks.add(f"{base}{h}.js")
 
         return chunks
 
-    def _check_env_files(self, base_url):
-        """Try to fetch exposed .env and config files"""
-        sensitive_paths = [
-            "/.env", "/.env.local", "/.env.production", "/.env.development",
-            "/config.js", "/env.js", "/settings.js", "/app.config.js",
-            "/config/config.js", "/src/config.js", "/js/config.js",
-            "/.git/config", "/robots.txt", "/sitemap.xml",
-            "/api/config", "/api/settings", "/api/env",
-            "/wp-config.php", "/config.php", "/configuration.php",
-        ]
-        for path in sensitive_paths:
-            url = urljoin(base_url, path)
-            content = self._fetch(url)
-            if content and len(content) > 10 and len(content) < 500000:
-                # Check if it's actually a config file (not 404 page)
-                if any(kw in content.lower() for kw in ["key", "secret", "password", "token", "api", "db_", "database"]):
-                    self.js_files[f"[CONFIG:{url}]"] = content
-                    print(f"  [!] Sensitive file accessible: {url} ({len(content):,} bytes)")
+    def _check_sourcemap(self, js_url, js_content):
+        """Check for sourcemap and try to fetch it"""
+        sm_match = re.search(r'//[#@]\s*sourceMappingURL=(.+)', js_content)
+        if sm_match:
+            sm_url_raw = sm_match.group(1).strip()
+            if not sm_url_raw.startswith("data:"):
+                sm_url = urljoin(js_url, sm_url_raw)
+                r = self._get(sm_url)
+                if r:
+                    try:
+                        sm_data = r.json()
+                        sources = sm_data.get("sourcesContent", [])
+                        source_names = sm_data.get("sources", [])
+                        for i, content in enumerate(sources):
+                            if content:
+                                name = source_names[i] if i < len(source_names) else f"source_{i}"
+                                self.sourcemaps[f"[SOURCEMAP:{name}]"] = content
+                        if sources:
+                            print(f"  [+] SourceMap! {len(sources)} source files extracted from {sm_url}")
+                    except:
+                        pass
+
+    def _download_js(self, js_url):
+        # Only download from same domain or subdomain
+        parsed = urlparse(js_url)
+        if parsed.netloc and self.domain not in parsed.netloc:
+            # Allow known CDNs for secret detection
+            cdn_whitelist = ["cdnjs", "unpkg", "jsdelivr", "googleapis", "gstatic", "cloudflare"]
+            if not any(cdn in parsed.netloc for cdn in cdn_whitelist):
+                return None
+        r = self._get(js_url)
+        if r and len(r.text) > 10:
+            return r.text
+        return None
+
+    def _crawl_page(self, url, depth=0):
+        if depth > self.depth or url in self.visited_pages:
+            return set()
+        self.visited_pages.add(url)
+        js_urls = set()
+
+        r = self._get(url)
+        if not r:
+            return js_urls
+
+        js_urls.update(self._extract_js_urls(url, r.text))
+
+        # Also crawl internal links (1 level)
+        if depth < 1:
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = urljoin(url, a["href"])
+                if urlparse(href).netloc == self.domain and href not in self.visited_pages:
+                    js_urls.update(self._crawl_page(href, depth + 1))
+
+        return js_urls
 
     def extract(self):
-        print(f"[*] Deep JS extraction from: {self.base_url}")
-        all_js_urls = set()
+        print(f"[*] JS Extractor v3 — Deep scan: {self.base_url}")
 
-        # Step 1: Crawl main page + common paths
-        pages_to_crawl = [self.base_url]
-        common_pages = ["/", "/login", "/register", "/dashboard", "/api", "/admin",
-                        "/static", "/assets", "/js", "/app"]
-        for p in common_pages:
-            pages_to_crawl.append(urljoin(self.base_url, p))
+        # 1. Crawl main page + linked pages
+        js_urls = self._crawl_page(self.base_url)
 
-        for page_url in pages_to_crawl[:8]:
-            html = self._fetch(page_url)
-            if html:
-                urls = self._extract_js_urls(html, page_url)
-                all_js_urls.update(urls)
-                webpack = self._discover_webpack_chunks(html, page_url)
-                all_js_urls.update(webpack)
+        # 2. Try common paths
+        print(f"[*] Probing {len(COMMON_PATHS)} common paths...")
+        for path in COMMON_PATHS:
+            js_urls.add(urljoin(self.base_url, path))
 
-        # Step 2: Common JS file paths
-        common_js = [
-            "/static/js/main.js", "/assets/js/app.js", "/js/bundle.js",
-            "/dist/bundle.js", "/build/static/js/main.chunk.js",
-            "/js/app.js", "/js/main.js", "/app.js", "/bundle.js",
-            "/dist/app.js", "/public/js/main.js", "/js/index.js",
-        ]
-        for p in common_js:
-            all_js_urls.add(urljoin(self.base_url, p))
+        # 3. Download all JS
+        print(f"[*] Downloading {len(js_urls)} candidate JS files...")
+        chunk_candidates = set()
 
-        # Step 3: Check exposed config/env files
-        self._check_env_files(self.base_url)
-
-        # Step 4: Download JS files + check source maps
-        print(f"[*] Downloading {len(all_js_urls)} JS files...")
-        for js_url in all_js_urls:
-            # Only same domain or CDN
-            content = self._fetch(js_url)
-            if content and len(content) > 50:
+        for js_url in js_urls:
+            content = self._download_js(js_url)
+            if content:
+                size = len(content)
+                fname = js_url.split("/")[-1][:50]
+                print(f"  [+] {fname} ({size:,} bytes)")
                 self.js_files[js_url] = content
-                print(f"  [+] {js_url.split('/')[-1][:50]} ({len(content):,} bytes)")
-                # Check source maps
+
+                # Check sourcemaps
                 self._check_sourcemap(js_url, content)
 
-        print(f"[+] Total: {len(self.js_files)} JS/source files")
+                # Discover webpack chunks
+                chunks = self._discover_webpack_chunks(content, self.base_url)
+                chunk_candidates.update(chunks)
+
+        # 4. Download discovered chunks
+        new_chunks = chunk_candidates - set(self.js_files.keys())
+        if new_chunks:
+            print(f"[*] Probing {len(new_chunks)} webpack chunks...")
+            for url in list(new_chunks)[:50]:
+                content = self._download_js(url)
+                if content:
+                    self.js_files[url] = content
+                    print(f"  [+] Chunk: {url.split('/')[-1]} ({len(content):,} bytes)")
+
+        # 5. Add sourcemap sources
+        self.js_files.update(self.sourcemaps)
+
+        print(f"\n[+] Total: {len(self.js_files)} JS files | {len(self.sourcemaps)} sourcemap sources")
         return self.js_files
